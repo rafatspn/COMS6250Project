@@ -109,6 +109,8 @@ def generate_text(target_class, vocab, model, max_len=MAX_LEN):
     generated_tokens = [list(vocab.keys())[int(idx) - 1] for idx in torch.round(input_tensor[0]).detach().numpy() if idx > 0]
     return " ".join(generated_tokens)
 
+
+
 # Accuracy Function
 def compute_accuracy(model, data_loader):
     model.eval()
