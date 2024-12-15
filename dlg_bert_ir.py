@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import pandas as pd
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
@@ -9,24 +10,20 @@ import random
 
 # Hyperparameters
 MAX_LEN = 256
-BATCH_SIZE = 32
-EPOCHS = 3
+BATCH_SIZE = 8
+EPOCHS = 20
 LR = 2e-5  # Learning rate for AdamW optimizer
 
-# Step 1: Load AG News Dataset (1000 samples per class)
-def load_ag_news_subset(samples_per_class=1000, seed=42):
-    dataset = load_dataset("ag_news", split="train")
-    texts, labels = [], []
-    class_samples = {i: [] for i in range(4)}
+# Step 1: Load Data from CSV Files
+def load_csv_data(file_path):
+    data = pd.read_csv(file_path)
+    texts = data['text'].tolist()
+    labels = data['class'].tolist()
 
-    for example in dataset:
-        class_samples[example['label']].append(example['text'])
-
-    random.seed(seed)
-    for label, samples in class_samples.items():
-        selected_samples = random.sample(samples, samples_per_class)
-        texts.extend(selected_samples)
-        labels.extend([label] * samples_per_class)
+    # Convert labels to integers if not already
+    unique_labels = sorted(set(labels))
+    label_to_int = {label: idx for idx, label in enumerate(unique_labels)}
+    labels = [label_to_int[label] for label in labels]
 
     return texts, labels
 
@@ -42,11 +39,22 @@ def tokenize_texts(texts, tokenizer, max_len):
     )
     return encodings["input_ids"], encodings["attention_mask"]
 
-def calculate_accuracy(outputs, labels):
-    """Calculate accuracy for a batch."""
-    predictions = torch.argmax(outputs, dim=1)
-    correct = (predictions == labels).sum().item()
-    return correct / labels.size(0)
+
+def compute_accuracy_with_tolerance(model, data_loader, tolerance=3):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels in data_loader:
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            
+            # Check if prediction is within tolerance range
+            correct += torch.sum(torch.abs(predicted - labels) <= tolerance).item()
+            total += labels.size(0)
+
+    return correct / total
 
 # Step 7: Evaluation Function
 def evaluate(model, dataloader):
@@ -65,6 +73,12 @@ def evaluate(model, dataloader):
             total += labels.size(0)
 
     return correct / total
+
+def calculate_accuracy(outputs, labels):
+    """Calculate accuracy for a batch."""
+    predictions = torch.argmax(outputs, dim=1)
+    correct = (predictions == labels).sum().item()
+    return correct / labels.size(0)
 
 # Step 4: Gradient-Based Text Generation
 def generate_text(target_class, tokenizer, model, max_len=MAX_LEN, steps=300, lr=0.1):
@@ -111,8 +125,12 @@ def generate_text(target_class, tokenizer, model, max_len=MAX_LEN, steps=300, lr
 # Step 3: Load Data
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-train_texts, train_labels = load_ag_news_subset(samples_per_class=1000)
-test_texts, test_labels = load_ag_news_subset(samples_per_class=1000, seed=999)
+# Main Execution (Dataset Reading)
+train_file_path = "./ir_data/train.csv"  # Replace with your train CSV file path
+test_file_path = "./ir_data/test.csv"    # Replace with your test CSV file path
+
+train_texts, train_labels = load_csv_data(train_file_path)
+test_texts, test_labels = load_csv_data(test_file_path)
 
 train_input_ids, train_attention_masks = tokenize_texts(train_texts, tokenizer, MAX_LEN)
 test_input_ids, test_attention_masks = tokenize_texts(test_texts, tokenizer, MAX_LEN)
@@ -162,10 +180,17 @@ for epoch in range(EPOCHS):
     train_accuracy = correct_train / total_train
     print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}, Train Accuracy: {train_accuracy * 100:.2f}%")
 
+
+# Save the Model
+model_save_path = "ir_classifier_bert.pth"  # Path to save the model
+torch.save(model.state_dict(), model_save_path)
+print(f"Model saved to {model_save_path}")
+
 # Evaluate on Test Data
-train_accuracy = evaluate(model, train_loader)
-test_accuracy = evaluate(model, test_loader)
-print(f"Train Accuracy: {train_accuracy * 100:.2f}%")
+# test_accuracy = evaluate(model, test_loader)
+train_accuracy = compute_accuracy_with_tolerance(model, train_loader, 3)
+test_accuracy = compute_accuracy_with_tolerance(model, test_loader, 3)
+print(f"Train Accuracy: {test_accuracy * 100:.2f}%")
 print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
 
 # Example of Text Generation

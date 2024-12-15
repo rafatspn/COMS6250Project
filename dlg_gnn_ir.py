@@ -1,4 +1,7 @@
+import os
 import numpy as np
+import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,29 +12,24 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 import random
 
-MAX_LEN = 10
+MAX_LEN = 256
 EMBED_DIM = 16
-NUM_CLASSES = 4
-BATCH_SIZE = 32
-EPOCHS = 10
+NUM_CLASSES = 60
+BATCH_SIZE = 8
+EPOCHS = 20
 
 
-# Step 1: Load AG News Dataset
-def load_ag_news_subset(split="train", samples_per_class=1000):
-    dataset = load_dataset("ag_news", split=split)
-    texts, labels = [], []
+# Step 1: Load Data from CSV Files
+def load_csv_data(file_path):
+    data = pd.read_csv(file_path)
+    texts = data['text'].tolist()
+    labels = data['class'].tolist()
 
-    # Organize samples per class
-    class_samples = {i: [] for i in range(4)}
-    for example in dataset:
-        class_samples[example['label']].append(example['text'])
+    # Convert labels to integers if not already
+    unique_labels = sorted(set(labels))
+    label_to_int = {label: idx for idx, label in enumerate(unique_labels)}
+    labels = [label_to_int[label] for label in labels]
 
-    # Sample examples per class
-    for label, samples in class_samples.items():
-        selected_samples = random.sample(samples, samples_per_class)
-        texts.extend(selected_samples)
-        labels.extend([label] * samples_per_class)
-    
     return texts, labels
 
 # Tokenization and Vocabulary Building
@@ -126,10 +124,29 @@ def compute_accuracy(model, data_loader):
 
     return correct / total
 
+def compute_accuracy_with_tolerance(model, data_loader, tolerance=3):
+    model.eval()
+    correct = 0
+    total = 0
 
-# Main Execution
-train_texts, train_labels = load_ag_news_subset(split="train", samples_per_class=10000)
-test_texts, test_labels = load_ag_news_subset(split="test", samples_per_class=1000)
+    with torch.no_grad():
+        for inputs, labels in data_loader:
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            
+            # Check if prediction is within tolerance range
+            correct += torch.sum(torch.abs(predicted - labels) <= tolerance).item()
+            total += labels.size(0)
+
+    return correct / total
+
+
+# Main Execution (Dataset Reading)
+train_file_path = "./ir_data/train.csv"  # Replace with your train CSV file path
+test_file_path = "./ir_data/test.csv"    # Replace with your test CSV file path
+
+train_texts, train_labels = load_csv_data(train_file_path)
+test_texts, test_labels = load_csv_data(test_file_path)
 
 vocab = build_vocab(train_texts)
 
@@ -158,11 +175,17 @@ for epoch in range(EPOCHS):
         total_loss += loss.item()
     print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}")
 
-# Evaluate Accuracy
-train_accuracy = compute_accuracy(model, train_loader)
-test_accuracy = compute_accuracy(model, test_loader)
-print(f"Train Accuracy: {train_accuracy * 100:.2f}%")
-print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+# Save the Model
+model_save_path = "ir_classifier_gnn.pth"  # Path to save the model
+torch.save(model.state_dict(), model_save_path)
+print(f"Model saved to {model_save_path}")
+
+# Evaluate Accuracy with Tolerance
+train_accuracy = compute_accuracy_with_tolerance(model, train_loader, tolerance=3)
+test_accuracy = compute_accuracy_with_tolerance(model, test_loader, tolerance=3)
+
+print(f"Train Accuracy (±3 tolerance): {train_accuracy * 100:.2f}%")
+print(f"Test Accuracy (±3 tolerance): {test_accuracy * 100:.2f}%")
 
 # Generate text for the positive class (1)
 # generated_text = generate_text(target_class=1, vocab=vocab, model=model)

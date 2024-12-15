@@ -1,0 +1,6 @@
+GNN
+Train Accuracy (±3 tolerance): 24.00%
+Test Accuracy (±3 tolerance): 1.98%
+
+BERT
+GPT
