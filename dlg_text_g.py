@@ -5,13 +5,33 @@ import torch.optim as optim
 from nltk.tokenize import word_tokenize
 from collections import Counter
 from itertools import chain
+from datasets import load_dataset
+import random
 
-# Step 1: Data Preparation
-train_texts = ["This is a great product", "Terrible experience", "I loved it", "Hated it", "It was fantastic"]
-train_labels = [1, 0, 1, 0, 1]  # 1: Positive, 0: Negative
+# Step 1: Load AG News Dataset (1000 samples per class)
+def load_ag_news_subset(samples_per_class=1000):
+    dataset = load_dataset("ag_news", split="train")  # Load full train split
+    texts, labels = [], []
+
+    # Organize samples per class
+    class_samples = {i: [] for i in range(4)}
+    for example in dataset:
+        class_samples[example['label']].append(example['text'])
+
+    # Sample 1000 examples per class
+    for label, samples in class_samples.items():
+        selected_samples = random.sample(samples, samples_per_class)
+        texts.extend(selected_samples)
+        labels.extend([label] * samples_per_class)
+    
+    return texts, labels
+
+# Load AG News data (1000 samples per class)
+train_texts, train_labels = load_ag_news_subset(samples_per_class=1000)
+
 MAX_LEN = 10
 EMBED_DIM = 16
-NUM_CLASSES = 2
+NUM_CLASSES = 4
 
 # Tokenization and Vocabulary Building
 def build_vocab(texts):
