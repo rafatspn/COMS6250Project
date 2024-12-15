@@ -1,130 +1,96 @@
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification
 
-opt_directory = "./resources"
+# Dataset: Text and Class
+class TextClassificationDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_length=128):
+        self.encodings = tokenizer(texts, truncation=True, padding='max_length', max_length=max_length, return_tensors="pt")
+        self.labels = torch.tensor(labels)
 
-os.makedirs(opt_directory, exist_ok=True)
+    def __len__(self):
+        return len(self.labels)
 
-# Define the neural network model
-class SimpleNet(nn.Module):
-    def __init__(self):
-        super(SimpleNet, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(28 * 28, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10)
-        )
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item['labels'] = self.labels[idx]
+        return item
 
-    def forward(self, x):
-        return self.fc(x)
+# Dummy Data (Replace with Real Dataset)
+texts = ["The mining disaster caused serious damage.", "Safety measures in underground mines are critical.",
+         "A rockburst incident occurred, leading to collapse."]
+labels = [0, 1, 0]  # Binary classification for demonstration
 
-# Gradient matching loss
-def gradient_matching_loss(dummy_data, dummy_label, model, loss_fn, true_gradients):
-    # Compute gradients for dummy data
-    dummy_output = model(dummy_data)
-    dummy_loss = loss_fn(dummy_output, dummy_label)
-    dummy_gradients = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
-    
-    # Compute the L2 norm between gradients (detach true_grad to avoid graph issues)
-    loss = 0
-    for dummy_grad, true_grad in zip(dummy_gradients, true_gradients):
-        loss += ((dummy_grad - true_grad.detach()).norm())**2
-    return loss
+# Load Tokenizer and Model
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
 
-def binarize_image(data, threshold=0.5):
-    """
-    Convert pixel values of a tensor to binary (0 or 1) based on a threshold.
+# Create Dataset and DataLoader
+dataset = TextClassificationDataset(texts, labels, tokenizer)
+data_loader = DataLoader(dataset, batch_size=1)
 
-    Args:
-        data (torch.Tensor): Input tensor with pixel values.
-        threshold (float): Threshold value to binarize the data.
+# Train the Model and Save Gradients
+optimizer = optim.Adam(model.parameters(), lr=5e-5)
+model.train()
+real_gradients = None
+for batch in data_loader:
+    batch = {k: v.to(model.device) for k, v in batch.items()}
+    optimizer.zero_grad()
+    outputs = model(**batch)
+    loss = outputs.loss
+    loss.backward()
+    if real_gradients is None:
+        real_gradients = [torch.zeros_like(param.grad) for param in model.parameters() if param.grad is not None]
+    for idx, param in enumerate(model.parameters()):
+        if param.grad is not None:
+            real_gradients[idx] += param.grad.clone()
+    optimizer.step()
 
-    Returns:
-        torch.Tensor: Binarized tensor where values are either 0 or 1.
-    """
-    with torch.no_grad():  # Disable gradient calculations for binarization
-        binary_data = torch.where(data >= threshold, torch.tensor(1.0, device=data.device), torch.tensor(0.0, device=data.device))
-    return binary_data
+# Finalize the averaged gradients for attack
+real_gradients = [grad / len(data_loader) for grad in real_gradients]
 
+# DLG Reconstruction: Matching Gradients
+class DeepLeakageAttack:
+    def __init__(self, model, tokenizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.model = model.to(device)
+        self.device = device
+        self.tokenizer = tokenizer
 
-def save_image(data, iteration, save_dir):
-    plt.imshow(data.detach().cpu().squeeze(), cmap='gray')
-    plt.title(f"Reconstructed Image at Iteration {iteration}")
-    plt.axis('off')
-    plt.savefig(os.path.join(save_dir, f"dlg_image_iter_{iteration}.png"))
-    print(f"Saved image at iteration {iteration}")
+    def reconstruct(self, real_gradients, lr=0.01, max_iter=300):
+        """
+        real_gradients: Gradients obtained from real data
+        lr: Learning rate for optimization
+        max_iter: Maximum iterations for reconstruction
+        """
+        dummy_data = torch.randint(0, self.model.config.vocab_size, (1, 128), dtype=torch.long, device=self.device, requires_grad=False)
+        dummy_data = dummy_data.clone().detach().requires_grad_(True)
+        dummy_labels = torch.randint(0, 2, (1,), device=self.device, requires_grad=True)
+        optimizer = optim.SGD([dummy_data, dummy_labels], lr=lr)
 
-# Main Function
-def main():
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        for i in range(max_iter):
+            optimizer.zero_grad()
+            outputs = self.model(input_ids=dummy_data, labels=dummy_labels)
+            dummy_gradients = torch.autograd.grad(outputs.loss, self.model.parameters(), create_graph=True)
 
-    # Load MNIST dataset
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+            # Compute Gradient Distance
+            grad_loss = 0
+            for g_real, g_dummy in zip(real_gradients, dummy_gradients):
+                grad_loss += ((g_real - g_dummy).pow(2)).sum()
+            grad_loss.backward()
+            optimizer.step()
 
-    # Initialize model and loss function
-    model = SimpleNet().to(device)
-    loss_fn = nn.CrossEntropyLoss()
+            if i % 50 == 0:
+                print(f"Iteration {i}: Gradient Loss = {grad_loss.item():.4f}")
 
-    # Select a data point
-    data_iter = iter(train_loader)
-    real_data, real_label = next(data_iter)
-    real_data, real_label = real_data.to(device), real_label.to(device)
+        return dummy_data, dummy_labels
 
-    # Compute true gradients for the real data
-    model.train()
-    optimizer = optim.SGD(model.parameters(), lr=0.1)
-    output = model(real_data)
-    loss = loss_fn(output, real_label)
-    true_gradients = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+# Reconstruct Text
+attack = DeepLeakageAttack(model, tokenizer)
+dummy_data, dummy_labels = attack.reconstruct(real_gradients)
 
-    # Initialize dummy data and label
-    dummy_data = torch.randn_like(real_data, requires_grad=True, device=device)
-    dummy_label = torch.randint(0, 10, (1,), device=device)
-
-    # Define LBFGS optimizer
-    optimizer_dummy = optim.LBFGS([dummy_data], lr=0.1)
-
-    # Reconstruct image using optimization
-    num_iterations = 1000
-    print("Starting reconstruction...")
-    for i in range(num_iterations):
-        def closure():
-            optimizer_dummy.zero_grad()
-            loss = gradient_matching_loss(dummy_data, dummy_label, model, loss_fn, true_gradients)
-            loss.backward(retain_graph=True)  # retain_graph to handle repeated calls
-            return loss
-
-        optimizer_dummy.step(closure)
-
-        if i % 100 == 0:
-            save_image(dummy_data, i, opt_directory)
-            print(f"Iteration {i}/{num_iterations}")
-
-
-    output_dummy = model(dummy_data)
-
-    dummy_data = binarize_image(dummy_data, 0.3)
-
-    print(output_dummy)
-
-    # Display the original and reconstructed images
-    plt.figure(figsize=(8, 4))
-    plt.subplot(1, 2, 1)
-    plt.title("Original Image")
-    plt.imshow(real_data.detach().cpu().squeeze(), cmap='gray')
-    plt.subplot(1, 2, 2)
-    plt.title("Reconstructed Image")
-    plt.imshow(dummy_data.detach().cpu().squeeze(), cmap='gray')
-    plt.show()
-    plt.savefig(os.path.join(opt_directory, "dlg_image_g.png"))
-
-if __name__ == "__main__":
-    main()
+# Decode the Reconstructed Text
+reconstructed_text = tokenizer.decode(dummy_data[0].detach().cpu().numpy(), skip_special_tokens=True)
+print("\nReconstructed Text:", reconstructed_text)
+print("Reconstructed Label:", dummy_labels.item())
