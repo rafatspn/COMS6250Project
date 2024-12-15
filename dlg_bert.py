@@ -111,8 +111,11 @@ def generate_text(target_class, tokenizer, model, max_len=MAX_LEN, steps=300, lr
 # Step 3: Load Data
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-train_texts, train_labels = load_ag_news_subset(samples_per_class=1000)
-test_texts, test_labels = load_ag_news_subset(samples_per_class=1000, seed=999)
+train_file_path = "./ir_data/train.csv"  # Replace with your train CSV file path
+test_file_path = "./ir_data/test.csv"    # Replace with your test CSV file path
+
+train_texts, train_labels = load_ag_news_subset(train_file_path)
+test_texts, test_labels = load_ag_news_subset(test_file_path)
 
 train_input_ids, train_attention_masks = tokenize_texts(train_texts, tokenizer, MAX_LEN)
 test_input_ids, test_attention_masks = tokenize_texts(test_texts, tokenizer, MAX_LEN)

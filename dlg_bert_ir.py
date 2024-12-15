@@ -4,9 +4,7 @@ import pandas as pd
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from datasets import load_dataset
 from transformers import BertTokenizer, BertForSequenceClassification, AdamW
-import random
 
 # Hyperparameters
 MAX_LEN = 256
@@ -15,17 +13,35 @@ EPOCHS = 20
 LR = 2e-5  # Learning rate for AdamW optimizer
 
 # Step 1: Load Data from CSV Files
-def load_csv_data(file_path):
-    data = pd.read_csv(file_path)
-    texts = data['text'].tolist()
-    labels = data['class'].tolist()
+def load_csv_data(train_file_path, test_file_path):
+    train_data = pd.read_csv(train_file_path)
+    test_data = pd.read_csv(test_file_path)
 
-    # Convert labels to integers if not already
-    unique_labels = sorted(set(labels))
+    train_texts = train_data['text'].tolist()
+    train_labels = train_data['class'].tolist()
+
+    test_texts = test_data['text'].tolist()
+    test_labels = test_data['class'].tolist()
+
+    # Filter out test labels that are not in train labels
+    valid_labels = set(train_labels)
+    filtered_test_texts = []
+    filtered_test_labels = []
+
+    for text, label in zip(test_texts, test_labels):
+        if label in valid_labels:
+            filtered_test_texts.append(text)
+            filtered_test_labels.append(label)
+
+    # Convert labels to integers
+    unique_labels = sorted(valid_labels)
     label_to_int = {label: idx for idx, label in enumerate(unique_labels)}
-    labels = [label_to_int[label] for label in labels]
 
-    return texts, labels
+    train_labels = [label_to_int[label] for label in train_labels]
+    filtered_test_labels = [label_to_int[label] for label in filtered_test_labels]
+
+    num_labels = len(unique_labels)
+    return train_texts, train_labels, filtered_test_texts, filtered_test_labels, num_labels
 
 # Step 2: Tokenization using BERT Tokenizer
 def tokenize_texts(texts, tokenizer, max_len):
@@ -39,118 +55,90 @@ def tokenize_texts(texts, tokenizer, max_len):
     )
     return encodings["input_ids"], encodings["attention_mask"]
 
-
-def compute_accuracy_with_tolerance(model, data_loader, tolerance=3):
+# Step 3: Evaluation Function with Tolerance
+def evaluate_with_tolerance_and_save(model, dataloader, device, output_file, tolerance=3):
     model.eval()
     correct = 0
     total = 0
 
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            
-            # Check if prediction is within tolerance range
-            correct += torch.sum(torch.abs(predicted - labels) <= tolerance).item()
-            total += labels.size(0)
-
-    return correct / total
-
-# Step 7: Evaluation Function
-def evaluate(model, dataloader):
-    model.eval()
-    correct = 0
-    total = 0
+    original_labels = []
+    predicted_labels = []
 
     with torch.no_grad():
         for batch in dataloader:
             input_ids, attention_masks, labels = [x.to(device) for x in batch]
-
             outputs = model(input_ids, attention_mask=attention_masks)
             predictions = torch.argmax(outputs.logits, dim=1)
-
-            correct += (predictions == labels).sum().item()
+            correct += (torch.abs(predictions - labels) <= tolerance).sum().item()
             total += labels.size(0)
 
-    return correct / total
+            original_labels.extend(labels.cpu().numpy())
+            predicted_labels.extend(predictions.cpu().numpy())
 
-def calculate_accuracy(outputs, labels):
-    """Calculate accuracy for a batch."""
-    predictions = torch.argmax(outputs, dim=1)
-    correct = (predictions == labels).sum().item()
-    return correct / labels.size(0)
+    accuracy = correct / total
+
+    # Save results to CSV
+    results_df = pd.DataFrame({
+        "original": original_labels,
+        "predicted": predicted_labels
+    })
+    results_df.to_csv(output_file, index=False)
+    print(f"Results saved to {output_file}")
+
+    return accuracy
+
 
 # Step 4: Gradient-Based Text Generation
-def generate_text(target_class, tokenizer, model, max_len=MAX_LEN, steps=300, lr=0.1):
+def generate_text(target_class, vocab, model, max_len=MAX_LEN):
     model.eval()
+    # Initialize input indices randomly as NumPy array
+    input_indices = np.random.randint(1, len(vocab), (1, max_len))
+    input_tensor = torch.tensor(input_indices, dtype=torch.float32, requires_grad=True)
 
-    # Initialize input_ids randomly as a LEAF tensor with requires_grad=True
-    vocab_size = tokenizer.vocab_size
-    input_ids = torch.randint(1, vocab_size, (1, max_len), dtype=torch.float32).to(device)
-    input_ids.requires_grad_()  # Make input_ids a leaf tensor with gradients enabled
+    optimizer_gen = optim.Adam([input_tensor], lr=0.1)
 
-    optimizer_gen = optim.Adam([input_ids], lr=lr)
-
-    for step in range(steps):
+    for step in range(300):
         optimizer_gen.zero_grad()
-
-        # Ensure valid input_ids (rounded and clamped)
-        input_ids_rounded = torch.round(input_ids).long().clamp(1, vocab_size - 1)
-
-        # Generate attention mask (1s for valid tokens, 0s for padding)
-        attention_mask = (input_ids_rounded != tokenizer.pad_token_id).long()
-
-        # Forward pass through the model
-        outputs = model(input_ids_rounded, attention_mask=attention_mask)
-        logits = outputs.logits
-
-        # Loss: maximize the logit for the target class
-        loss = -logits[0, target_class]
+        logits = model(torch.round(input_tensor).long())  # Ensure valid indices
+        loss = -logits[0, target_class]  # Maximize the logit for the target class
         loss.backward()
         optimizer_gen.step()
 
-        # Clamp input_ids to ensure they remain valid token indices
         with torch.no_grad():
-            input_ids.clamp_(1, vocab_size - 1)
+            input_tensor.clamp_(1, len(vocab))  # Keep indices within the valid vocab range
 
-        # Print progress every 50 steps
-        if (step + 1) % 50 == 0:
-            print(f"Step {step+1}, Loss: {loss.item():.4f}")
+    generated_tokens = [list(vocab.keys())[int(idx) - 1] for idx in torch.round(input_tensor[0]).detach().numpy() if idx > 0]
+    return " ".join(generated_tokens)
 
-    # Decode the optimized input_ids to text
-    final_input_ids = torch.round(input_ids).long().clamp(1, vocab_size - 1)
-    generated_tokens = tokenizer.decode(final_input_ids[0], skip_special_tokens=True)
-    return generated_tokens
 
-# Step 3: Load Data
+# Step 4: Load Data
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
-# Main Execution (Dataset Reading)
 train_file_path = "./ir_data/train.csv"  # Replace with your train CSV file path
 test_file_path = "./ir_data/test.csv"    # Replace with your test CSV file path
 
-train_texts, train_labels = load_csv_data(train_file_path)
-test_texts, test_labels = load_csv_data(test_file_path)
+train_texts, train_labels, test_texts, test_labels, num_labels = load_csv_data(train_file_path, test_file_path)
 
+# Tokenize texts
 train_input_ids, train_attention_masks = tokenize_texts(train_texts, tokenizer, MAX_LEN)
 test_input_ids, test_attention_masks = tokenize_texts(test_texts, tokenizer, MAX_LEN)
 
-train_labels = torch.tensor(train_labels)
-test_labels = torch.tensor(test_labels)
+# Convert labels to tensors
+train_labels = torch.tensor(train_labels, dtype=torch.long)
+test_labels = torch.tensor(test_labels, dtype=torch.long)
 
-# Step 4: Create DataLoaders
+# Step 5: Create DataLoaders
 train_dataset = TensorDataset(train_input_ids, train_attention_masks, train_labels)
 test_dataset = TensorDataset(test_input_ids, test_attention_masks, test_labels)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
-# Step 5: Initialize BERT Model
-model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=4)
+# Step 6: Initialize BERT Model
+model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=num_labels)
 optimizer = AdamW(model.parameters(), lr=LR)
 criterion = nn.CrossEntropyLoss()
 
-# Step 6: Training Loop
+# Step 7: Training Loop
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
@@ -174,28 +162,24 @@ for epoch in range(EPOCHS):
 
         # Track metrics
         total_loss += loss.item()
+        # predictions = torch.argmax(logits, dim=1)
+        # correct_train += (torch.abs(predictions - labels) <= 3).sum().item()
         correct_train += (torch.argmax(logits, dim=1) == labels).sum().item()
         total_train += labels.size(0)
 
     train_accuracy = correct_train / total_train
-    print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}, Train Accuracy: {train_accuracy * 100:.2f}%")
-
+    print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}, Train Accuracy (Tolerance 3): {train_accuracy * 100:.2f}%")
 
 # Save the Model
 model_save_path = "ir_classifier_bert.pth"  # Path to save the model
 torch.save(model.state_dict(), model_save_path)
 print(f"Model saved to {model_save_path}")
 
-# Evaluate on Test Data
-# test_accuracy = evaluate(model, test_loader)
-train_accuracy = compute_accuracy_with_tolerance(model, train_loader, 3)
-test_accuracy = compute_accuracy_with_tolerance(model, test_loader, 3)
-print(f"Train Accuracy: {test_accuracy * 100:.2f}%")
-print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+train_results_file = "train_results.csv"
+train_accuracy = evaluate_with_tolerance_and_save(model, test_loader, device, train_results_file, tolerance=3)
+print(f"Train Accuracy (Tolerance 3): {train_accuracy * 100:.2f}%")
 
-# Example of Text Generation
-# target_class = 1  # Example: Generate text for class 1 (Sports)
-# generated_text = generate_text(target_class, tokenizer, model)
-# print(f"Generated Text for Class {target_class}:", generated_text)
-
+test_results_file = "test_results.csv"
+test_accuracy = evaluate_with_tolerance_and_save(model, test_loader, device, test_results_file, tolerance=3)
+print(f"Test Accuracy (Tolerance 3): {test_accuracy * 100:.2f}%")
 
